@@ -751,3 +751,113 @@ void lzma_default_properties(struct lzma_properties *p, int level)
 	p->mf.depth = (16 + (p->mf.nice_len >> 1)) >> 1;
 }
 
+#include <stdlib.h>
+#include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+#if 0
+const char text[] = "HABEABDABABABHHHEAAAAAAAA";
+#elif 0
+const char text[] = "abcde_bcdefgh_abcdefghxxxxxxx";
+#else
+const char text[] = "The only time we actually leave the path spinning is if we're truncating "
+"a small amount and don't actually free an extent, which is not a common "
+"occurrence.  We have to set the path blocking in order to add the "
+"delayed ref anyway, so the first extent we find we set the path to "
+"blocking and stay blocking for the duration of the operation.  With the "
+"upcoming file extent map stuff there will be another case that we have "
+"to have the path blocking, so just swap to blocking always.";
+#endif
+
+static const uint8_t lzma_header[] = {
+	0x5D,				/* LZMA model properties (lc, lp, pb) in encoded form */
+	0x00, 0x00, 0x80, 0x00,		/* Dictionary size (32-bit unsigned integer, little-endian) */
+	0xFF, 0xFF, 0xFF, 0xFF,
+	0xFF, 0xFF, 0xFF, 0xFF,		/* Uncompressed size (64-bit unsigned integer, little-endian) */
+};
+
+int main(int argc, char *argv[])
+{
+	char *outfile;
+	struct lzma_encoder lzmaenc = {0};
+	struct lzma_properties props = {
+		.mf.dictsize = 65536,
+	};
+	struct lzma_encoder_destsize dstsize;
+	uint8_t buf[2048];
+	int inf, outf;
+
+	int err;
+
+	lzmaenc.mf.buffer = malloc(65536) + 1;
+
+	if (argc >= 3) {
+		int len;
+
+		inf = open(argv[2], O_RDONLY);
+
+		len = lseek(inf, 0, SEEK_END);
+		printf("len: %d\n", len);
+
+		lseek(inf, 0, SEEK_SET);
+		read(inf, lzmaenc.mf.buffer, len);
+		close(inf);
+		lzmaenc.mf.iend = lzmaenc.mf.buffer + len;
+	} else {
+		memcpy(lzmaenc.mf.buffer, text, sizeof(text));
+		lzmaenc.mf.iend = lzmaenc.mf.buffer + sizeof(text);
+	}
+	lzmaenc.op = buf;
+	lzmaenc.oend = buf + sizeof(buf);
+	lzmaenc.finish = true;
+
+	lzmaenc.need_eopm = true;
+	dstsize.capacity = 2048; //UINT32_MAX;
+	lzmaenc.dstsize = &dstsize;
+
+
+	lzma_default_properties(&props, 5);
+	lzma_encoder_reset(&lzmaenc, &props);
+
+	err = __lzma_encode(&lzmaenc);
+
+	printf("%d\n", err);
+
+	rc_encode(&lzmaenc.rc, &lzmaenc.op, lzmaenc.oend);
+
+	if (err != -ERANGE) {
+		memcpy(lzmaenc.op, dstsize.ending, dstsize.esz);
+		lzmaenc.op += dstsize.esz;
+	} else {
+		encode_eopm(&lzmaenc);
+		rc_flush(&lzmaenc.rc);
+
+		rc_encode(&lzmaenc.rc, &lzmaenc.op, lzmaenc.oend);
+	}
+
+	printf("encoded length: %lu\n", lzmaenc.op - buf);
+
+	if (argc < 2)
+		outfile = "output.bin.lzma";
+	else
+		outfile = argv[1];
+
+	outf = open(outfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	write(outf, lzma_header, sizeof(lzma_header));
+	write(outf, buf, lzmaenc.op - buf);
+	close(outf);
+
+#if 0
+	nliterals = lzma_get_optimum_fast(&lzmaenc, &back_res, &len_res);
+	printf("nlits %d (%d %d)\n", nliterals, back_res, len_res);
+	encode_sequence(&lzmaenc, nliterals, back_res, len_res, &position);
+	nliterals = lzma_get_optimum_fast(&lzmaenc, &back_res, &len_res);
+	printf("nlits %d (%d %d)\n", nliterals, back_res, len_res);
+	nliterals = lzma_get_optimum_fast(&lzmaenc, &back_res, &len_res);
+	printf("nlits %d (%d %d)\n", nliterals, back_res, len_res);
+	nliterals = lzma_get_optimum_fast(&lzmaenc, &back_res, &len_res);
+	printf("nlits %d (%d %d)\n", nliterals, back_res, len_res);
+#endif
+}
+
