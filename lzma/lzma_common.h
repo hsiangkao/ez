@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: Unlicense */
 /*
- * lzma/lzma_common.h - common definitions of LZMA encoder
+ * ez/lzma/lzma_common.h - common definitions of LZMA encoder
  *
  * Copyright (C) 2019-2020 Gao Xiang <hsiangkao@aol.com>
  ×
