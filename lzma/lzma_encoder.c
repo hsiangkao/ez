@@ -10,7 +10,7 @@
  */
 #include <stdlib.h>
 #include <ez/bitops.h>
-#include "rc_encoder.h"
+#include "rc_encoder_ckpt.h"
 #include "lzma_common.h"
 #include "mf.h"
 
@@ -72,12 +72,23 @@ struct lzma_length_encoder {
 	probability high[kLenNumHighSymbols];
 };
 
+struct lzma_encoder_destsize {
+	struct lzma_rc_ckpt cp;
+
+	uint8_t *op;
+	uint32_t capacity;
+
+	uint32_t esz;
+	uint8_t ending[LZMA_REQUIRED_INPUT_MAX + 5];
+};
+
 struct lzma_encoder {
 	struct lzma_mf mf;
 	struct lzma_rc_encoder rc;
 
 	uint8_t *op, *oend;
 	bool finish;
+	bool need_eopm;
 
 	unsigned int state;
 
@@ -109,6 +120,8 @@ struct lzma_encoder {
 		struct lzma_match matches[kMatchMaxLen];
 		unsigned int matches_count;
 	} fast;
+
+	struct lzma_encoder_destsize *dstsize;
 };
 
 #define change_pair(smalldist, bigdist) (((bigdist) >> 7) > (smalldist))
@@ -443,6 +456,46 @@ static void rep_match(struct lzma_encoder *lzma, const uint32_t pos_state,
 	}
 }
 
+struct lzma_endstate {
+	struct lzma_length_encoder lenEnc;
+
+	probability simpleMatch[2];
+	probability posSlot[kNumPosSlotBits];
+	probability posAlign[kNumAlignBits];
+};
+
+static void encode_eopm_stateless(struct lzma_encoder *lzma,
+				  struct lzma_endstate *endstate)
+{
+	const uint32_t pos_state =
+		(lzma->mf.cur - lzma->mf.lookahead) & lzma->pbMask;
+	const unsigned int state = lzma->state;
+	unsigned int i;
+
+	endstate->simpleMatch[0] = lzma->isMatch[state][pos_state];
+	endstate->simpleMatch[1] = lzma->isRep[state];
+	endstate->lenEnc = lzma->lenEnc;
+
+	rc_bit(&lzma->rc, endstate->simpleMatch, 1);
+	rc_bit(&lzma->rc, endstate->simpleMatch + 1, 0);
+	length(&lzma->rc, &endstate->lenEnc, pos_state, kMatchMinLen);
+
+	for (i = 0; i < kNumPosSlotBits; ++i) {
+		endstate->posSlot[i] =
+			lzma->posSlotEncoder[0][(1 << (i + 1)) - 1];
+		rc_bit(&lzma->rc, endstate->posSlot + i, 1);
+	}
+
+	rc_direct(&lzma->rc, (1 << (30 - kNumAlignBits)) - 1,
+		  30 - kNumAlignBits);
+
+	for (i = 0; i < kNumAlignBits; ++i) {
+		endstate->posAlign[i] =
+			lzma->posAlignEncoder[(1 << (i + 1)) - 1];
+		rc_bit(&lzma->rc, endstate->posAlign + i, 1);
+	}
+}
+
 static void encode_eopm(struct lzma_encoder *lzma)
 {
 	const uint32_t pos_state =
@@ -454,8 +507,86 @@ static void encode_eopm(struct lzma_encoder *lzma)
 	match(lzma, pos_state, UINT32_MAX, kMatchMinLen);
 }
 
+static int __flush_symbol_destsize(struct lzma_encoder *lzma)
+{
+	uint8_t *op2;
+	unsigned symbols_size;
+	unsigned int esz = 0;
+
+	if (lzma->dstsize->capacity < 5)
+		return -ENOSPC;
+
+	if (!lzma->rc.pos) {
+		rc_write_checkpoint(&lzma->rc, &lzma->dstsize->cp);
+		lzma->dstsize->op = lzma->op;
+	}
+
+	if (rc_encode(&lzma->rc, &lzma->op, lzma->oend))
+		return -ENOSPC;
+
+	op2 = lzma->op;
+	symbols_size = op2 - lzma->dstsize->op;
+	if (lzma->dstsize->capacity < symbols_size + 5)
+		goto err_enospc;
+
+	if (!lzma->need_eopm)
+		goto out;
+
+	if (lzma->dstsize->capacity < symbols_size +
+	    LZMA_REQUIRED_INPUT_MAX + 5) {
+		struct lzma_rc_ckpt cp2;
+		struct lzma_endstate endstate;
+		uint8_t ending[sizeof(lzma->dstsize->ending)];
+		uint8_t *ep;
+
+		rc_write_checkpoint(&lzma->rc, &cp2);
+		encode_eopm_stateless(lzma, &endstate);
+		rc_flush(&lzma->rc);
+
+		ep = ending;
+		if (rc_encode(&lzma->rc, &ep, ending + sizeof(ending)))
+			DBG_BUGON(1);
+
+		esz = ep - ending;
+
+		if (lzma->dstsize->capacity < symbols_size + esz)
+			goto err_enospc;
+		rc_restore_checkpoint(&lzma->rc, &cp2);
+
+		memcpy(lzma->dstsize->ending, ending, sizeof(ending));
+		lzma->dstsize->esz = esz;
+	}
+
+out:
+	lzma->dstsize->capacity -= symbols_size;
+	lzma->dstsize->esz = esz;
+	return 0;
+
+err_enospc:
+	rc_restore_checkpoint(&lzma->rc, &lzma->dstsize->cp);
+	lzma->op = lzma->dstsize->op;
+	lzma->dstsize->capacity = 0;
+	return -ENOSPC;
+}
+
 static int flush_symbol(struct lzma_encoder *lzma)
 {
+	if (lzma->rc.count && lzma->dstsize) {
+		const unsigned int safemargin =
+			5 + (LZMA_REQUIRED_INPUT_MAX << !!lzma->need_eopm);
+		uint8_t *op;
+		bool ret;
+
+		if (lzma->dstsize->capacity < safemargin)
+			return __flush_symbol_destsize(lzma);
+
+		op = lzma->op;
+		ret = rc_encode(&lzma->rc, &lzma->op, lzma->oend);
+
+		lzma->dstsize->capacity -= lzma->op - op;
+		return ret ? -ENOSPC : 0;
+	}
+
 	return rc_encode(&lzma->rc, &lzma->op, lzma->oend) ? -ENOSPC : 0;
 }
 
