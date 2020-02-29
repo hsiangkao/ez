@@ -229,9 +229,8 @@ int lzma_mf_find(struct lzma_mf *mf, struct lzma_match *matches, bool finish)
 
 	i = ret;
 	do {
-		const uint8_t *cur = ip + matches[i].len;
+		const uint8_t *cur = ip + matches[--i].len;
 
-		--i;
 		if (matches[i].len < mf->nice_len || cur >= iend)
 			break;
 
