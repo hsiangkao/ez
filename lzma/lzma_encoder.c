@@ -410,9 +410,12 @@ static void match(struct lzma_encoder *lzma, const uint32_t pos_state,
 
 			rc_direct(&lzma->rc, dist_reduced >> kNumAlignBits,
 				  footer_bits - kNumAlignBits);
-			rc_bittree_reverse(&lzma->rc, lzma->posAlignEncoder,
+
+/*			rc_bittree_reverse(&lzma->rc, lzma->posAlignEncoder,
 					   kNumAlignBits,
-					   dist_reduced & kAlignMask);
+					   dist_reduced & kAlignMask); */
+			rc_bittree_reverse(&lzma->rc, lzma->posAlignEncoder,
+					   kNumAlignBits, dist);
 		}
 	}
 	lzma->reps[3] = lzma->reps[2];
