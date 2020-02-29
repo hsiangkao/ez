@@ -794,6 +794,7 @@ int main(int argc, char *argv[])
 	int err;
 
 	lzmaenc.mf.buffer = malloc(65536) + 1;
+	lzmaenc.mf.buffer[-1] = 0;
 
 	if (argc >= 3) {
 		int len;
